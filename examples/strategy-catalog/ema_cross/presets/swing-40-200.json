@@ -1,0 +1,11 @@
+{
+  "display_name": "Swing 40/200",
+  "strategy": {
+    "fast_period": 40,
+    "slow_period": 200,
+    "quantity": 0.001
+  },
+  "run": {
+    "interval": "15m"
+  }
+}

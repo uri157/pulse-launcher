@@ -1,0 +1,8 @@
+{
+  "workspace": "/home/dev/Developments/pulse-project/pulse-launcher",
+  "catalog_dirs": [
+    "/home/dev/Developments/strategies-catalog"
+  ],
+  "pulse_cmd": "python -m pulse",
+  "pulse_cwd": "/home/dev/Developments/pulse-project/pulse"
+}

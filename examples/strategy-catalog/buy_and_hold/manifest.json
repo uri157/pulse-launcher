@@ -1,0 +1,16 @@
+{
+  "display_name": "Buy and Hold",
+  "description": "Single BUY market order and hold position.",
+  "strategy_name": "buy_and_hold",
+  "default_strategy": {
+    "quantity": 0.001
+  },
+  "default_run": {
+    "stream_mode": "kline",
+    "interval": "1m",
+    "bot_id_hint": "pulse-buy-hold"
+  },
+  "default_platform": {
+    "enabled": true
+  }
+}

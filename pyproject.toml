@@ -1,0 +1,19 @@
+[project]
+name = "pulse-launcher"
+version = "0.1.0"
+description = "Terminal launcher UI for Pulse runtime"
+readme = "docs/quickstart.md"
+requires-python = ">=3.10"
+dependencies = [
+  "textual>=0.58,<1.0",
+]
+
+[project.scripts]
+pulse-launcher = "pulse_launcher.app:main"
+
+[build-system]
+requires = ["setuptools>=69.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["pulse_launcher"]

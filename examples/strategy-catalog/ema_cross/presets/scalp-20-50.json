@@ -1,0 +1,11 @@
+{
+  "display_name": "Scalp 20/50",
+  "strategy": {
+    "fast_period": 20,
+    "slow_period": 50,
+    "quantity": 0.001
+  },
+  "run": {
+    "interval": "1m"
+  }
+}

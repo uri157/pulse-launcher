@@ -1,0 +1,18 @@
+{
+  "display_name": "EMA Cross",
+  "description": "EMA crossover strategy over kline stream.",
+  "strategy_name": "ema_cross",
+  "default_strategy": {
+    "fast_period": 40,
+    "slow_period": 200,
+    "quantity": 0.001
+  },
+  "default_run": {
+    "stream_mode": "kline",
+    "interval": "1m",
+    "bot_id_hint": "pulse-ema"
+  },
+  "default_platform": {
+    "enabled": true
+  }
+}
