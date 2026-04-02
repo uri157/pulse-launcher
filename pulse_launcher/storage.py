@@ -35,6 +35,15 @@ DEFAULT_CHRONOS: dict[str, Any] = {
     "timeout_seconds": 8.0,
 }
 
+DEFAULT_LOGGING: dict[str, Any] = {
+    "enabled": False,
+    "directory": "./logs",
+    "file_name": "pulse-runtime.log",
+    "max_bytes": 10 * 1024 * 1024,
+    "backup_count": 8,
+    "level": "INFO",
+}
+
 DEFAULT_CREDENTIALS: dict[str, Any] = {}
 
 
@@ -50,6 +59,7 @@ class StrategyManifest:
     default_run: dict[str, Any]
     default_broker: dict[str, Any]
     default_chronos: dict[str, Any]
+    default_logging: dict[str, Any]
     default_credentials: dict[str, Any]
     strategy_paths: list[str]
 
@@ -63,6 +73,7 @@ class StrategyPreset:
     run: dict[str, Any]
     broker: dict[str, Any]
     chronos: dict[str, Any]
+    logging: dict[str, Any]
     credentials: dict[str, Any]
     strategy_paths: list[str]
 
@@ -173,6 +184,7 @@ def _parse_manifest(manifest_path: Path) -> StrategyManifest:
     default_run = dict(payload.get("default_run") or {})
     default_broker = dict(payload.get("default_broker") or {})
     default_chronos = dict(payload.get("default_chronos") or payload.get("default_platform") or {})
+    default_logging = dict(payload.get("default_logging") or {})
     default_credentials = dict(payload.get("default_credentials") or {})
 
     include_source_dir = bool(payload.get("include_source_dir", True))
@@ -202,6 +214,7 @@ def _parse_manifest(manifest_path: Path) -> StrategyManifest:
         default_run=default_run,
         default_broker=default_broker,
         default_chronos=default_chronos,
+        default_logging=default_logging,
         default_credentials=default_credentials,
         strategy_paths=strategy_paths,
     )
@@ -265,6 +278,7 @@ def load_presets_for_manifest(manifest: StrategyManifest) -> list[StrategyPreset
                 run=dict(payload.get("run") or {}),
                 broker=dict(payload.get("broker") or {}),
                 chronos=dict(payload.get("chronos") or payload.get("platform") or {}),
+                logging=dict(payload.get("logging") or {}),
                 credentials=dict(payload.get("credentials") or {}),
                 strategy_paths=strategy_paths,
             )
@@ -304,6 +318,7 @@ def build_base_config(manifest: StrategyManifest) -> dict[str, Any]:
         "run": run_payload,
         "broker": deep_merge(DEFAULT_BROKER, manifest.default_broker),
         "chronos": deep_merge(DEFAULT_CHRONOS, manifest.default_chronos),
+        "logging": deep_merge(DEFAULT_LOGGING, manifest.default_logging),
         "credentials": deep_merge(DEFAULT_CREDENTIALS, manifest.default_credentials),
         "strategy": dict(manifest.default_strategy),
     }
@@ -319,6 +334,7 @@ def apply_preset(config: dict[str, Any], preset: StrategyPreset) -> dict[str, An
     )
     updated["broker"] = deep_merge(dict(updated.get("broker") or {}), preset.broker)
     updated["chronos"] = deep_merge(dict(updated.get("chronos") or {}), preset.chronos)
+    updated["logging"] = deep_merge(dict(updated.get("logging") or {}), preset.logging)
     updated["credentials"] = deep_merge(
         dict(updated.get("credentials") or {}),
         preset.credentials,
@@ -388,5 +404,25 @@ def validate_effective_config(payload: dict[str, Any]) -> list[str]:
         errors.append(
             f"broker '{adapter}' cannot publish Chronos telemetry sink"
         )
+
+    logging_payload = payload.get("logging")
+    if logging_payload is not None and not isinstance(logging_payload, dict):
+        errors.append("logging config must be an object when provided")
+        return errors
+    if isinstance(logging_payload, dict):
+        max_bytes = logging_payload.get("max_bytes")
+        if max_bytes is not None:
+            try:
+                if int(max_bytes) < 1:
+                    errors.append("logging.max_bytes must be >= 1")
+            except (TypeError, ValueError):
+                errors.append("logging.max_bytes must be an integer")
+        backup_count = logging_payload.get("backup_count")
+        if backup_count is not None:
+            try:
+                if int(backup_count) < 1:
+                    errors.append("logging.backup_count must be >= 1")
+            except (TypeError, ValueError):
+                errors.append("logging.backup_count must be an integer")
 
     return errors

@@ -2,9 +2,13 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import base64
 import json
 import os
 import shlex
+import shutil
+import subprocess
+from collections import deque
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -27,6 +31,7 @@ from pulse_launcher.keyring import (
 from pulse_launcher.settings import LauncherSettingsError, resolve_launcher_settings
 from pulse_launcher.storage import (
     BrokerDescriptor,
+    DEFAULT_LOGGING,
     LauncherStorageError,
     StrategyManifest,
     StrategyPreset,
@@ -129,7 +134,8 @@ class PulseLauncherApp(App[None]):
     }
 
     #actions,
-    #catalog_actions {
+    #catalog_actions,
+    #copy_actions {
       height: auto;
       margin-bottom: 1;
     }
@@ -167,9 +173,13 @@ class PulseLauncherApp(App[None]):
         self.presets_by_strategy: dict[str, list[StrategyPreset]] = {}
         self.broker_descriptors: list[BrokerDescriptor] = list_broker_descriptors()
         self._keyring_sync_enabled: bool = True
+        self._log_persist_enabled: bool = False
         self._process: asyncio.subprocess.Process | None = None
         self._stream_tasks: list[asyncio.Task[None]] = []
         self._watcher_task: asyncio.Task[None] | None = None
+        self._last_err_lines: deque[str] = deque(maxlen=8)
+        self._run_log_path: Path | None = None
+        self._run_log_handle: Any | None = None
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
@@ -224,6 +234,12 @@ class PulseLauncherApp(App[None]):
                     id="keyring_sync_btn",
                     variant="success",
                 )
+                yield Label("Persist Runtime Logs", classes="section-label")
+                yield Button(
+                    "Persist Logs: Disabled",
+                    id="log_persist_btn",
+                    variant="warning",
+                )
 
                 with Horizontal(id="catalog_actions"):
                     yield Button("Load Base", id="load_base_btn")
@@ -240,6 +256,11 @@ class PulseLauncherApp(App[None]):
             with Vertical(id="right"):
                 yield Label("Command Preview", classes="section-label")
                 yield Static("", id="command_preview")
+
+                with Horizontal(id="copy_actions"):
+                    yield Button("Copy Runtime JSON", id="copy_runtime_btn")
+                    yield Button("Copy Strategy JSON", id="copy_strategy_btn")
+                    yield Button("Copy Effective JSON", id="copy_effective_btn")
 
                 with Horizontal(id="actions"):
                     yield Button("Run", id="run_btn", variant="success")
@@ -274,9 +295,24 @@ class PulseLauncherApp(App[None]):
         if button_id == "preview_btn":
             self._update_command_preview()
             return
+        if button_id == "copy_runtime_btn":
+            self._copy_runtime_json_to_clipboard()
+            return
+        if button_id == "copy_strategy_btn":
+            self._copy_strategy_json_to_clipboard()
+            return
+        if button_id == "copy_effective_btn":
+            self._copy_effective_json_to_clipboard()
+            return
         if button_id == "keyring_sync_btn":
             self._keyring_sync_enabled = not self._keyring_sync_enabled
             self._refresh_keyring_sync_button()
+            self._apply_control_overrides()
+            self._update_command_preview()
+            return
+        if button_id == "log_persist_btn":
+            self._log_persist_enabled = not self._log_persist_enabled
+            self._refresh_log_persist_button()
             self._apply_control_overrides()
             self._update_command_preview()
             return
@@ -324,7 +360,52 @@ class PulseLauncherApp(App[None]):
     def _append_log(self, line: str) -> None:
         ts = datetime.now().strftime("%H:%M:%S")
         log = self.query_one("#process_log", Log)
-        log.write_line(f"[{ts}] {line}")
+        entry = f"[{ts}] {line}"
+        log.write_line(entry)
+        if self._run_log_handle is not None:
+            try:
+                self._run_log_handle.write(entry + "\n")
+                self._run_log_handle.flush()
+            except Exception:
+                pass
+
+    def _open_run_log(self) -> None:
+        try:
+            runs_dir = self.workspace / ".launcher" / "runs"
+            runs_dir.mkdir(parents=True, exist_ok=True)
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            path = runs_dir / f"pulse_run_{timestamp}.log"
+            self._run_log_handle = path.open("w", encoding="utf-8")
+            self._run_log_path = path
+            self._prune_run_logs(runs_dir, keep=200)
+        except Exception:
+            self._run_log_handle = None
+            self._run_log_path = None
+
+    @staticmethod
+    def _prune_run_logs(runs_dir: Path, *, keep: int) -> None:
+        try:
+            files = sorted(
+                runs_dir.glob("pulse_run_*.log"),
+                key=lambda item: item.stat().st_mtime,
+                reverse=True,
+            )
+            for stale in files[keep:]:
+                try:
+                    stale.unlink()
+                except Exception:
+                    continue
+        except Exception:
+            return
+
+    def _close_run_log(self) -> None:
+        handle = self._run_log_handle
+        self._run_log_handle = None
+        if handle is not None:
+            try:
+                handle.close()
+            except Exception:
+                pass
 
     def _render_catalog_dirs(self) -> None:
         panel = self.query_one("#catalog_dirs", Static)
@@ -457,6 +538,12 @@ class PulseLauncherApp(App[None]):
         self._keyring_sync_enabled = bool(credentials_payload.get("save_to_keyring", True))
         self._refresh_keyring_sync_button()
 
+        logging_payload = runtime_payload.get("logging")
+        if not isinstance(logging_payload, dict):
+            logging_payload = {}
+        self._log_persist_enabled = bool(logging_payload.get("enabled", False))
+        self._refresh_log_persist_button()
+
     def _refresh_keyring_sync_button(self) -> None:
         button = self.query_one("#keyring_sync_btn", Button)
         if self._keyring_sync_enabled:
@@ -464,6 +551,15 @@ class PulseLauncherApp(App[None]):
             button.variant = "success"
         else:
             button.label = "Save To Keyring: Disabled"
+            button.variant = "warning"
+
+    def _refresh_log_persist_button(self) -> None:
+        button = self.query_one("#log_persist_btn", Button)
+        if self._log_persist_enabled:
+            button.label = "Persist Logs: Enabled"
+            button.variant = "success"
+        else:
+            button.label = "Persist Logs: Disabled"
             button.variant = "warning"
 
     def _apply_control_overrides(self) -> None:
@@ -499,6 +595,14 @@ class PulseLauncherApp(App[None]):
             credentials_payload = {}
         credentials_payload["save_to_keyring"] = self._keyring_sync_enabled
         runtime_payload["credentials"] = credentials_payload
+
+        logging_payload = runtime_payload.get("logging")
+        if not isinstance(logging_payload, dict):
+            logging_payload = {}
+        for key, default_value in DEFAULT_LOGGING.items():
+            logging_payload.setdefault(key, default_value)
+        logging_payload["enabled"] = self._log_persist_enabled
+        runtime_payload["logging"] = logging_payload
 
         runtime_editor.load_text(json.dumps(runtime_payload, indent=2, ensure_ascii=True))
 
@@ -744,6 +848,191 @@ class PulseLauncherApp(App[None]):
         runtime_payload["strategy"] = strategy_payload
         return runtime_payload
 
+    def _copy_text_to_clipboard(self, *, text: str, label: str, suffix: str) -> None:
+        methods: list[str] = []
+        # 1) Native clipboard commands if available on host (fast / reliable).
+        clip_commands: list[list[str]] = []
+        custom_clipboard_command = os.environ.get("PULSE_LAUNCHER_CLIPBOARD_CMD", "").strip()
+        if custom_clipboard_command:
+            try:
+                custom_parts = shlex.split(custom_clipboard_command)
+                if custom_parts:
+                    clip_commands.append(custom_parts)
+            except ValueError:
+                pass
+
+        # tmux internal paste buffer (works even without host clipboard access).
+        if os.environ.get("TMUX") and shutil.which("tmux"):
+            clip_commands.append(["tmux", "load-buffer", "-"])
+
+        if shutil.which("wl-copy"):
+            clip_commands.append(["wl-copy"])
+        if shutil.which("xclip"):
+            clip_commands.append(["xclip", "-selection", "clipboard"])
+        if shutil.which("xsel"):
+            clip_commands.append(["xsel", "--clipboard", "--input"])
+        if shutil.which("pbcopy"):
+            clip_commands.append(["pbcopy"])
+        if shutil.which("clip.exe"):
+            clip_commands.append(["clip.exe"])
+
+        # Common WSL/Windows absolute paths when not in PATH.
+        wsl_clip = "/mnt/c/Windows/System32/clip.exe"
+        if os.path.exists(wsl_clip):
+            clip_commands.append([wsl_clip])
+        wsl_powershell = "/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe"
+        if os.path.exists(wsl_powershell):
+            clip_commands.append([wsl_powershell, "-NoProfile", "-Command", "$input | Set-Clipboard"])
+
+        for command in clip_commands:
+            try:
+                subprocess.run(
+                    command,
+                    input=text,
+                    text=True,
+                    check=True,
+                    timeout=2.0,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+                methods.append(command[0])
+                break
+            except Exception:
+                continue
+
+        # 2) Tkinter clipboard fallback (works on many Linux/X11 desktops).
+        if os.environ.get("DISPLAY"):
+            try:
+                import tkinter as tk
+
+                root = tk.Tk()
+                root.withdraw()
+                root.clipboard_clear()
+                root.clipboard_append(text)
+                # Flush clipboard update to X server.
+                root.update()
+                root.destroy()
+                methods.append("tkinter")
+            except Exception:
+                pass
+
+        # 3) OSC52 fallback (can be slow on some terminals); disabled by default.
+        osc52_enabled = os.environ.get("PULSE_LAUNCHER_ENABLE_OSC52", "").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+        max_osc52_bytes = 16384
+        if not methods and osc52_enabled and len(text.encode("utf-8")) <= max_osc52_bytes:
+            # Built-in Textual OSC52 (BEL terminator)
+            try:
+                self.copy_to_clipboard(text)
+                methods.append("osc52")
+            except Exception:
+                pass
+
+            # OSC52 alternative terminator (ST)
+            driver = getattr(self, "_driver", None)
+            if driver is not None:
+                try:
+                    b64 = base64.b64encode(text.encode("utf-8")).decode("utf-8")
+                    osc52_st = f"\x1b]52;c;{b64}\x1b\\"
+                    driver.write(osc52_st)
+                    methods.append("osc52-st")
+                except Exception:
+                    pass
+
+        # Always persist a local fallback copy for zero-loss UX.
+        fallback_path = self.workspace / ".launcher" / f"copied_{suffix}.json"
+        try:
+            fallback_path.parent.mkdir(parents=True, exist_ok=True)
+            fallback_path.write_text(text, encoding="utf-8")
+        except Exception:
+            fallback_path = Path("")
+
+        if methods:
+            methods_label = ", ".join(methods)
+            if fallback_path:
+                self._set_status(
+                    f"{label} copied ({methods_label}). Backup: {fallback_path}"
+                )
+            else:
+                self._set_status(f"{label} copied ({methods_label})")
+            return
+
+        if fallback_path:
+            self._set_status(
+                f"Clipboard not available in this terminal. Saved {label} to {fallback_path}. "
+                "Optional: set PULSE_LAUNCHER_CLIPBOARD_CMD",
+                error=True,
+            )
+        else:
+            self._set_status(
+                f"Clipboard not available in this terminal for {label}",
+                error=True,
+            )
+
+    def _copy_runtime_json_to_clipboard(self) -> None:
+        runtime_editor = self.query_one("#runtime_editor", TextArea)
+        try:
+            runtime_payload = self._parse_editor_object(
+                runtime_editor.text,
+                label="Pulse runtime config",
+            )
+        except LauncherStorageError as exc:
+            self._set_status(str(exc), error=True)
+            return
+
+        try:
+            text = json.dumps(runtime_payload, indent=2, ensure_ascii=True)
+        except Exception as exc:
+            self._set_status(f"Could not copy runtime JSON: {exc}", error=True)
+            return
+        self._copy_text_to_clipboard(
+            text=text,
+            label="Runtime JSON",
+            suffix="runtime",
+        )
+
+    def _copy_strategy_json_to_clipboard(self) -> None:
+        strategy_editor = self.query_one("#strategy_editor", TextArea)
+        try:
+            strategy_payload = self._parse_editor_object(
+                strategy_editor.text,
+                label="Strategy params",
+            )
+        except LauncherStorageError as exc:
+            self._set_status(str(exc), error=True)
+            return
+
+        try:
+            text = json.dumps(strategy_payload, indent=2, ensure_ascii=True)
+        except Exception as exc:
+            self._set_status(f"Could not copy strategy JSON: {exc}", error=True)
+            return
+        self._copy_text_to_clipboard(
+            text=text,
+            label="Strategy JSON",
+            suffix="strategy",
+        )
+
+    def _copy_effective_json_to_clipboard(self) -> None:
+        try:
+            payload = self._read_editor_config()
+            text = json.dumps(payload, indent=2, ensure_ascii=True)
+        except LauncherStorageError as exc:
+            self._set_status(str(exc), error=True)
+            return
+        except Exception as exc:
+            self._set_status(f"Could not copy effective JSON: {exc}", error=True)
+            return
+        self._copy_text_to_clipboard(
+            text=text,
+            label="Effective JSON",
+            suffix="effective",
+        )
+
     def _load_base_from_selected(self) -> None:
         manifest = self._selected_manifest()
         if manifest is None:
@@ -805,8 +1094,82 @@ class PulseLauncherApp(App[None]):
         if not prefix:
             raise LauncherStorageError("Pulse command produced empty argv")
 
+        executable = prefix[0]
+        if executable == "python" and shutil.which("python") is None:
+            python3_bin = shutil.which("python3")
+            if python3_bin:
+                prefix[0] = python3_bin
+                executable = python3_bin
+        if "/" in executable:
+            if not Path(executable).exists():
+                raise LauncherStorageError(f"Pulse command executable not found: {executable}")
+        elif shutil.which(executable) is None:
+            raise LauncherStorageError(
+                f"Pulse command executable not found in PATH: {executable}"
+            )
+
         command = prefix + ["run", "--config", str(self._effective_config_path())]
         return command, cwd
+
+    @staticmethod
+    def _is_pulse_module_command(command: list[str]) -> bool:
+        return len(command) >= 3 and command[1] == "-m" and command[2] == "pulse"
+
+    @staticmethod
+    def _interpreter_has_module(executable: str, module_name: str) -> bool:
+        try:
+            result = subprocess.run(
+                [executable, "-c", f"import {module_name}"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=2.0,
+                check=False,
+                text=True,
+            )
+        except Exception:
+            return False
+        return result.returncode == 0
+
+    def _resolve_runtime_python_for_pulse(self, command: list[str]) -> list[str]:
+        if not self._is_pulse_module_command(command):
+            return command
+
+        runtime_exe = command[0]
+        resolved_runtime_exe = runtime_exe
+        if "/" not in runtime_exe:
+            resolved_runtime_exe = shutil.which(runtime_exe) or runtime_exe
+
+        if self._interpreter_has_module(resolved_runtime_exe, "websockets"):
+            return command
+
+        candidates: list[str] = []
+        if Path("/usr/bin/python3").exists():
+            candidates.append("/usr/bin/python3")
+        py3 = shutil.which("python3")
+        if py3:
+            candidates.append(py3)
+
+        seen: set[str] = set()
+        for candidate in candidates:
+            normalized = str(Path(candidate).resolve())
+            if normalized in seen:
+                continue
+            seen.add(normalized)
+            if normalized == str(Path(resolved_runtime_exe).resolve()):
+                continue
+            if self._interpreter_has_module(normalized, "websockets"):
+                patched = list(command)
+                patched[0] = normalized
+                self._append_log(
+                    f"Runtime python '{resolved_runtime_exe}' missing websockets; switching to '{normalized}'"
+                )
+                return patched
+
+        raise LauncherStorageError(
+            "Pulse python runtime is missing 'websockets'. "
+            f"Interpreter: {resolved_runtime_exe}. "
+            "Install deps in that interpreter: pip install -r /home/dev/Developments/pulse-project/pulse/requirements.txt"
+        )
 
     def _update_command_preview(self) -> None:
         preview = self.query_one("#command_preview", Static)
@@ -820,12 +1183,22 @@ class PulseLauncherApp(App[None]):
             if config_errors:
                 raise LauncherStorageError("; ".join(config_errors))
             command, cwd = self._build_command()
+            command = self._resolve_runtime_python_for_pulse(command)
             shell_line = " ".join(shlex.quote(arg) for arg in command)
             strategy_name = str(resolved_config.get("strategy_name") or "")
             strategy_paths = resolved_config.get("strategy_paths") or []
             paths_summary = ", ".join(str(item) for item in strategy_paths) or "(none)"
             broker_adapter = str((resolved_config.get("broker") or {}).get("adapter") or "(none)")
             chronos_enabled = bool((resolved_config.get("chronos") or {}).get("enabled", False))
+            logging_payload = resolved_config.get("logging")
+            if not isinstance(logging_payload, dict):
+                logging_payload = {}
+            logs_enabled = bool(logging_payload.get("enabled", False))
+            logs_target = (
+                f"{logging_payload.get('directory', './logs')}/{logging_payload.get('file_name', 'pulse-runtime.log')}"
+                if logs_enabled
+                else "disabled"
+            )
             preview.update(
                 f"$ {shell_line}\n"
                 f"cwd: {cwd}\n"
@@ -834,6 +1207,7 @@ class PulseLauncherApp(App[None]):
                 f"strategy_paths: {paths_summary}\n"
                 f"broker: {broker_adapter}\n"
                 f"chronos: {'enabled' if chronos_enabled else 'disabled'}\n"
+                f"logs: {logs_target}\n"
                 f"credentials: {credentials_note}"
             )
             self._set_status("Config valid")
@@ -856,6 +1230,7 @@ class PulseLauncherApp(App[None]):
             if config_errors:
                 raise LauncherStorageError("; ".join(config_errors))
             command, cwd = self._build_command()
+            command = self._resolve_runtime_python_for_pulse(command)
         except LauncherStorageError as exc:
             self._set_status(str(exc), error=True)
             return
@@ -874,16 +1249,32 @@ class PulseLauncherApp(App[None]):
             merged = strategy_paths + ([previous] if previous else [])
             env["PYTHONPATH"] = os.pathsep.join(merged)
 
+        self._last_err_lines.clear()
+        self._close_run_log()
+        self._open_run_log()
         self._append_log("Launching Pulse runtime")
         self._append_log("$ " + " ".join(shlex.quote(item) for item in command))
+        self._append_log(f"effective_config={effective_path}")
 
-        self._process = await asyncio.create_subprocess_exec(
-            *command,
-            cwd=str(cwd),
-            env=env,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
+        try:
+            self._process = await asyncio.create_subprocess_exec(
+                *command,
+                cwd=str(cwd),
+                env=env,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+        except Exception as exc:
+            self._append_log(f"Failed to spawn process: {exc}")
+            if self._run_log_path is not None:
+                self._set_status(
+                    f"Failed to spawn process: {exc}. log: {self._run_log_path}",
+                    error=True,
+                )
+            else:
+                self._set_status(f"Failed to spawn process: {exc}", error=True)
+            self._close_run_log()
+            return
 
         assert self._process.stdout is not None
         assert self._process.stderr is not None
@@ -903,6 +1294,8 @@ class PulseLauncherApp(App[None]):
                     return
                 text = chunk.decode("utf-8", errors="replace").rstrip("\n")
                 self._append_log(f"[{channel}] {text}")
+                if channel == "ERR" and text.strip():
+                    self._last_err_lines.append(text.strip())
         except asyncio.CancelledError:
             return
 
@@ -918,7 +1311,24 @@ class PulseLauncherApp(App[None]):
         if rc == 0:
             self._set_status("Pulse stopped")
         else:
-            self._set_status(f"Pulse exited with code {rc}", error=True)
+            last_error = self._last_err_lines[-1] if self._last_err_lines else ""
+            if self._run_log_path is not None:
+                if last_error:
+                    self._set_status(
+                        f"Pulse exited with code {rc}: {last_error}. log: {self._run_log_path}",
+                        error=True,
+                    )
+                else:
+                    self._set_status(
+                        f"Pulse exited with code {rc}. log: {self._run_log_path}",
+                        error=True,
+                    )
+            else:
+                if last_error:
+                    self._set_status(f"Pulse exited with code {rc}: {last_error}", error=True)
+                else:
+                    self._set_status(f"Pulse exited with code {rc}", error=True)
+        self._close_run_log()
 
     async def _stop_process(self) -> None:
         process = self._process
