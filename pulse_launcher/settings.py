@@ -20,6 +20,8 @@ class LauncherSettings:
     catalog_dirs: list[Path]
     pulse_cmd: str
     pulse_cwd: Path
+    keyring_path: Path
+    keyring_passphrase_env: str
     config_path: Path | None
 
 
@@ -135,10 +137,35 @@ def resolve_launcher_settings(args: Any) -> LauncherSettings:
         raise LauncherSettingsError("pulse_cwd must be a non-empty string")
     pulse_cwd = _resolve_path(pulse_cwd_raw.strip(), base_dir=config_base)
 
+    keyring_path_raw = (
+        getattr(args, "keyring_path", None)
+        or env.get("PULSE_LAUNCHER_KEYRING_PATH")
+        or config_payload.get("keyring_path")
+        or str((workspace / ".launcher" / "keyring.enc.json").resolve())
+    )
+    if not isinstance(keyring_path_raw, str) or not keyring_path_raw.strip():
+        raise LauncherSettingsError("keyring_path must be a non-empty string")
+    keyring_path = _resolve_path(keyring_path_raw.strip(), base_dir=config_base)
+
+    keyring_passphrase_env_raw = (
+        getattr(args, "keyring_passphrase_env", None)
+        or env.get("PULSE_LAUNCHER_KEYRING_PASSPHRASE_ENV")
+        or config_payload.get("keyring_passphrase_env")
+        or "PULSE_LAUNCHER_KEYRING_PASSPHRASE"
+    )
+    if (
+        not isinstance(keyring_passphrase_env_raw, str)
+        or not keyring_passphrase_env_raw.strip()
+    ):
+        raise LauncherSettingsError("keyring_passphrase_env must be a non-empty string")
+    keyring_passphrase_env = keyring_passphrase_env_raw.strip()
+
     return LauncherSettings(
         workspace=workspace,
         catalog_dirs=catalog_dirs,
         pulse_cmd=pulse_cmd,
         pulse_cwd=pulse_cwd,
+        keyring_path=keyring_path,
+        keyring_passphrase_env=keyring_passphrase_env,
         config_path=config_path,
     )

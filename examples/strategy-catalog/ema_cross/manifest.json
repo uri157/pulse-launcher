@@ -9,10 +9,16 @@
   },
   "default_run": {
     "stream_mode": "kline",
-    "interval": "1m",
-    "bot_id_hint": "pulse-ema"
+    "interval": "1m"
   },
-  "default_platform": {
+  "default_broker": {
+    "adapter": "chronos_simulator"
+  },
+  "default_chronos": {
     "enabled": true
+  },
+  "default_credentials": {
+    "provider": "local_encrypted_file",
+    "venue": "chronos_simulator"
   }
 }

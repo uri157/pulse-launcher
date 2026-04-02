@@ -13,16 +13,30 @@ from textual.app import App, ComposeResult
 from textual.containers import Horizontal, Vertical
 from textual.widgets import Button, Footer, Header, Input, Label, Log, Select, Static, TextArea
 
+from pulse_launcher.keyring import (
+    KeyringError,
+    build_strategy_fingerprint,
+    find_by_selector,
+    normalize_selector,
+    read_encrypted_keyring,
+    selector_missing_required,
+    supported_provider,
+    upsert_record,
+    write_encrypted_keyring,
+)
 from pulse_launcher.settings import LauncherSettingsError, resolve_launcher_settings
 from pulse_launcher.storage import (
+    BrokerDescriptor,
     LauncherStorageError,
     StrategyManifest,
     StrategyPreset,
     apply_preset,
     build_base_config,
     ensure_workspace,
+    list_broker_descriptors,
     load_presets_for_manifest,
     load_strategy_manifests,
+    validate_effective_config,
 )
 
 
@@ -77,9 +91,11 @@ class PulseLauncherApp(App[None]):
       padding: 0 1;
     }
 
-    #config_editor {
+    #runtime_editor,
+    #strategy_editor {
       height: 1fr;
       border: round $primary;
+      margin-bottom: 1;
     }
 
     #command_preview {
@@ -131,6 +147,8 @@ class PulseLauncherApp(App[None]):
         *,
         default_pulse_cmd: str,
         default_pulse_cwd: Path,
+        keyring_path: Path,
+        keyring_passphrase_env: str,
         config_path: Path | None,
     ) -> None:
         super().__init__()
@@ -138,9 +156,12 @@ class PulseLauncherApp(App[None]):
         self.catalog_dirs = [Path(path).expanduser().resolve() for path in catalog_dirs]
         self.default_pulse_cmd = default_pulse_cmd
         self.default_pulse_cwd = default_pulse_cwd
+        self.keyring_path = keyring_path.expanduser().resolve()
+        self.keyring_passphrase_env = keyring_passphrase_env
         self.config_path = config_path
         self.manifests: dict[str, StrategyManifest] = {}
         self.presets_by_strategy: dict[str, list[StrategyPreset]] = {}
+        self.broker_descriptors: list[BrokerDescriptor] = list_broker_descriptors()
         self._process: asyncio.subprocess.Process | None = None
         self._stream_tasks: list[asyncio.Task[None]] = []
         self._watcher_task: asyncio.Task[None] | None = None
@@ -175,6 +196,23 @@ class PulseLauncherApp(App[None]):
                     allow_blank=False,
                     id="preset_select",
                 )
+                yield Label("Broker Adapter", classes="section-label")
+                broker_options = (
+                    [(item.display_name, item.adapter_id) for item in self.broker_descriptors]
+                    if self.broker_descriptors
+                    else [("(no adapters)", "__none__")]
+                )
+                yield Select(
+                    broker_options,
+                    allow_blank=False,
+                    id="broker_select",
+                )
+                yield Label("Chronos Telemetry", classes="section-label")
+                yield Select(
+                    [("Disabled", "disabled"), ("Enabled", "enabled")],
+                    allow_blank=False,
+                    id="chronos_select",
+                )
 
                 with Horizontal(id="catalog_actions"):
                     yield Button("Load Base", id="load_base_btn")
@@ -183,8 +221,10 @@ class PulseLauncherApp(App[None]):
                 yield Static("Ready", id="status")
 
             with Vertical(id="editor-pane"):
-                yield Label("Effective Config (JSON)", classes="section-label")
-                yield TextArea("{}", id="config_editor")
+                yield Label("Pulse Runtime Config (JSON)", classes="section-label")
+                yield TextArea("{}", id="runtime_editor")
+                yield Label("Strategy Params (JSON)", classes="section-label")
+                yield TextArea("{}", id="strategy_editor")
 
             with Vertical(id="right"):
                 yield Label("Command Preview", classes="section-label")
@@ -234,9 +274,23 @@ class PulseLauncherApp(App[None]):
         if event.select.id == "strategy_select":
             self._refresh_preset_options()
             self._load_base_from_selected()
+            return
+        if event.select.id == "preset_select":
+            value = event.value
+            if value in (None, Select.BLANK, "__none__"):
+                self._load_base_from_selected()
+                return
+            # Always apply presets from strategy base config so switching
+            # presets yields deterministic effective configs.
+            self._load_base_from_selected()
+            self._apply_selected_preset()
+            return
+        if event.select.id in {"broker_select", "chronos_select"}:
+            self._apply_control_overrides()
+            self._update_command_preview()
 
     def on_text_area_changed(self, event: TextArea.Changed) -> None:
-        if event.text_area.id == "config_editor":
+        if event.text_area.id in {"runtime_editor", "strategy_editor"}:
             self._update_command_preview()
 
     async def action_safe_quit(self) -> None:
@@ -262,15 +316,19 @@ class PulseLauncherApp(App[None]):
             if self.config_path is not None
             else "config: (none)"
         )
+        keyring_label = (
+            f"keyring: {self.keyring_path} (passphrase env: {self.keyring_passphrase_env})"
+        )
         if not self.catalog_dirs:
             panel.update(
                 f"{config_label}\n"
+                f"{keyring_label}\n"
                 "No catalog dirs configured.\n"
                 "Use --catalog-dir, env, or config file."
             )
             return
         body = "\n".join(f"- {path}" for path in self.catalog_dirs)
-        panel.update(f"{config_label}\n{body}")
+        panel.update(f"{config_label}\n{keyring_label}\n{body}")
 
     def _reload_catalog(self) -> None:
         try:
@@ -345,19 +403,292 @@ class PulseLauncherApp(App[None]):
         preset_select.value = "__none__"
 
     def _set_editor_config(self, payload: dict[str, Any]) -> None:
-        editor = self.query_one("#config_editor", TextArea)
-        editor.load_text(json.dumps(payload, indent=2, ensure_ascii=True))
+        runtime_editor = self.query_one("#runtime_editor", TextArea)
+        strategy_editor = self.query_one("#strategy_editor", TextArea)
+        runtime_payload = {key: value for key, value in payload.items() if key != "strategy"}
+        runtime_payload = self._sanitize_runtime_payload(runtime_payload)
+        strategy_payload = payload.get("strategy")
+        if not isinstance(strategy_payload, dict):
+            strategy_payload = {}
 
-    def _read_editor_config(self) -> dict[str, Any]:
-        editor = self.query_one("#config_editor", TextArea)
-        raw = editor.text
+        runtime_editor.load_text(json.dumps(runtime_payload, indent=2, ensure_ascii=True))
+        strategy_editor.load_text(json.dumps(strategy_payload, indent=2, ensure_ascii=True))
+        self._sync_control_selects(runtime_payload)
+
+    def _sync_control_selects(self, runtime_payload: dict[str, Any]) -> None:
+        broker_select = self.query_one("#broker_select", Select)
+        chronos_select = self.query_one("#chronos_select", Select)
+
+        broker_payload = runtime_payload.get("broker")
+        if not isinstance(broker_payload, dict):
+            broker_payload = {}
+        adapter = str(broker_payload.get("adapter") or "chronos_simulator").strip().lower()
+        known_adapter_ids = {item.adapter_id for item in self.broker_descriptors}
+        if adapter in known_adapter_ids:
+            broker_select.value = adapter
+
+        chronos_payload = runtime_payload.get("chronos")
+        if not isinstance(chronos_payload, dict):
+            legacy_platform = runtime_payload.get("platform")
+            chronos_payload = legacy_platform if isinstance(legacy_platform, dict) else {}
+        chronos_enabled = bool(chronos_payload.get("enabled", False))
+        chronos_select.value = "enabled" if chronos_enabled else "disabled"
+
+    def _apply_control_overrides(self) -> None:
+        runtime_editor = self.query_one("#runtime_editor", TextArea)
+        try:
+            runtime_payload = self._parse_editor_object(
+                runtime_editor.text,
+                label="Pulse runtime config",
+            )
+        except LauncherStorageError:
+            return
+
+        broker_select = self.query_one("#broker_select", Select)
+        broker_value = broker_select.value
+        if broker_value not in (None, Select.BLANK, "__none__"):
+            broker_payload = runtime_payload.get("broker")
+            if not isinstance(broker_payload, dict):
+                broker_payload = {}
+            broker_payload["adapter"] = str(broker_value)
+            runtime_payload["broker"] = broker_payload
+
+        chronos_select = self.query_one("#chronos_select", Select)
+        chronos_payload = runtime_payload.get("chronos")
+        if not isinstance(chronos_payload, dict):
+            legacy_platform = runtime_payload.get("platform")
+            chronos_payload = legacy_platform if isinstance(legacy_platform, dict) else {}
+        chronos_payload["enabled"] = chronos_select.value == "enabled"
+        runtime_payload["chronos"] = chronos_payload
+        runtime_payload.pop("platform", None)
+
+        runtime_editor.load_text(json.dumps(runtime_payload, indent=2, ensure_ascii=True))
+
+    @staticmethod
+    def _parse_editor_object(raw: str, *, label: str) -> dict[str, Any]:
         try:
             payload = json.loads(raw)
         except json.JSONDecodeError as exc:
-            raise LauncherStorageError(f"invalid JSON config: {exc}") from exc
+            raise LauncherStorageError(f"invalid JSON in {label}: {exc}") from exc
         if not isinstance(payload, dict):
-            raise LauncherStorageError("effective config root must be a JSON object")
+            raise LauncherStorageError(f"{label} root must be a JSON object")
         return payload
+
+    @staticmethod
+    def _sanitize_runtime_payload(runtime_payload: dict[str, Any]) -> dict[str, Any]:
+        cleaned = dict(runtime_payload)
+        run_payload = cleaned.get("run")
+        if isinstance(run_payload, dict):
+            run_clean = dict(run_payload)
+            for deprecated_key in (
+                "session_id",
+                "bot_id_hint",
+                "auto_start_session",
+                "stop_on_session_end",
+                "session_poll_seconds",
+            ):
+                run_clean.pop(deprecated_key, None)
+            cleaned["run"] = run_clean
+        return cleaned
+
+    @staticmethod
+    def _is_missing_secret(value: Any) -> bool:
+        normalized = str(value or "").strip().lower()
+        if not normalized:
+            return True
+        placeholders = {
+            "replace-api-key",
+            "replace-api-secret",
+            "<api-key>",
+            "<api-secret>",
+            "changeme",
+        }
+        return normalized in placeholders
+
+    def _build_selector_payload(
+        self,
+        *,
+        runtime_payload: dict[str, Any],
+        credentials_payload: dict[str, Any],
+    ) -> dict[str, str]:
+        broker_payload = runtime_payload.get("broker")
+        broker_adapter = ""
+        if isinstance(broker_payload, dict):
+            broker_adapter = str(broker_payload.get("adapter") or "").strip().lower()
+
+        strategy_name = str(runtime_payload.get("strategy_name") or "").strip()
+        strategy_payload = runtime_payload.get("strategy")
+        if not isinstance(strategy_payload, dict):
+            strategy_payload = {}
+
+        try:
+            strategy_fingerprint = build_strategy_fingerprint(
+                strategy_name=strategy_name,
+                strategy_payload=strategy_payload,
+            )
+        except KeyringError as exc:
+            raise LauncherStorageError(str(exc)) from exc
+
+        selector_payload = credentials_payload.get("selector")
+        selector_raw: dict[str, Any] = {}
+        if isinstance(selector_payload, dict):
+            selector_raw = dict(selector_payload)
+        elif selector_payload is not None:
+            raise LauncherStorageError("credentials.selector must be an object when provided")
+
+        venue = str(
+            selector_raw.get("venue")
+            or credentials_payload.get("venue")
+            or broker_adapter
+        ).strip().lower()
+
+        deployment_id = str(
+            selector_raw.get("deployment_id")
+            or credentials_payload.get("deployment_id")
+            or ""
+        ).strip()
+
+        strategy_fingerprint_value = str(
+            selector_raw.get("strategy_fingerprint") or strategy_fingerprint
+        ).strip().lower()
+
+        return {
+            "venue": venue,
+            "strategy_fingerprint": strategy_fingerprint_value,
+            "deployment_id": deployment_id,
+        }
+
+    def _resolve_credentials_for_runtime(
+        self,
+        payload: dict[str, Any],
+        *,
+        persist: bool,
+    ) -> tuple[dict[str, Any], str]:
+        runtime_payload = dict(payload)
+        run_payload = dict(runtime_payload.get("run") or {})
+        credentials_payload = runtime_payload.get("credentials")
+        if not isinstance(credentials_payload, dict):
+            runtime_payload["run"] = run_payload
+            return runtime_payload, "manual (run.api_key/api_secret)"
+
+        provider = str(credentials_payload.get("provider") or "local_encrypted_file").strip().lower()
+        if not supported_provider(provider):
+            raise LauncherStorageError(
+                f"unsupported credentials.provider '{provider}'"
+            )
+
+        try:
+            selector = normalize_selector(
+                self._build_selector_payload(
+                    runtime_payload=runtime_payload,
+                    credentials_payload=credentials_payload,
+                )
+            )
+            missing_selector_fields = selector_missing_required(selector)
+        except KeyringError as exc:
+            raise LauncherStorageError(str(exc)) from exc
+
+        if missing_selector_fields:
+            fields = ", ".join(missing_selector_fields)
+            raise LauncherStorageError(
+                f"credentials.selector missing required fields: {fields}"
+            )
+
+        api_key = str(run_payload.get("api_key") or "").strip()
+        api_secret = str(run_payload.get("api_secret") or "").strip()
+
+        inline_api_key = str(credentials_payload.get("api_key") or "").strip()
+        inline_api_secret = str(credentials_payload.get("api_secret") or "").strip()
+        if (
+            self._is_missing_secret(api_key)
+            and self._is_missing_secret(api_secret)
+            and inline_api_key
+            and inline_api_secret
+        ):
+            api_key = inline_api_key
+            api_secret = inline_api_secret
+
+        has_manual_credentials = (
+            not self._is_missing_secret(api_key)
+            and not self._is_missing_secret(api_secret)
+        )
+
+        if has_manual_credentials and not persist:
+            run_payload["api_key"] = api_key
+            run_payload["api_secret"] = api_secret
+            runtime_payload["run"] = run_payload
+            return runtime_payload, "manual (run.api_key/api_secret)"
+
+        keyring_path_raw = str(credentials_payload.get("keyring_path") or "").strip()
+        keyring_path = (
+            Path(keyring_path_raw).expanduser().resolve()
+            if keyring_path_raw
+            else self.keyring_path
+        )
+        passphrase_env = str(
+            credentials_payload.get("passphrase_env") or self.keyring_passphrase_env
+        ).strip()
+        if not passphrase_env:
+            raise LauncherStorageError("credentials.passphrase_env must be a non-empty string")
+
+        passphrase = os.environ.get(passphrase_env, "").strip()
+        if not passphrase and not has_manual_credentials:
+            raise LauncherStorageError(
+                f"missing keyring passphrase env '{passphrase_env}'"
+            )
+        if not passphrase and has_manual_credentials:
+            run_payload["api_key"] = api_key
+            run_payload["api_secret"] = api_secret
+            runtime_payload["run"] = run_payload
+            return runtime_payload, "manual (keyring sync skipped: missing passphrase env)"
+
+        try:
+            records = read_encrypted_keyring(keyring_path, passphrase)
+        except KeyringError as exc:
+            raise LauncherStorageError(str(exc)) from exc
+
+        if has_manual_credentials:
+            run_payload["api_key"] = api_key
+            run_payload["api_secret"] = api_secret
+            runtime_payload["run"] = run_payload
+            if persist:
+                label = str(credentials_payload.get("label") or "").strip()
+                try:
+                    next_records = upsert_record(
+                        records,
+                        selector=selector,
+                        api_key=api_key,
+                        api_secret=api_secret,
+                        label=label,
+                    )
+                    write_encrypted_keyring(keyring_path, passphrase, next_records)
+                except KeyringError as exc:
+                    raise LauncherStorageError(str(exc)) from exc
+            return runtime_payload, f"manual + keyring ({keyring_path})"
+
+        try:
+            resolved = find_by_selector(records, selector)
+        except KeyringError as exc:
+            raise LauncherStorageError(str(exc)) from exc
+        if resolved is None:
+            raise LauncherStorageError(
+                "no credentials found in keyring for selector"
+            )
+
+        run_payload["api_key"] = resolved.api_key
+        run_payload["api_secret"] = resolved.api_secret
+        runtime_payload["run"] = run_payload
+        return runtime_payload, f"keyring ({keyring_path})"
+
+    def _read_editor_config(self) -> dict[str, Any]:
+        runtime_editor = self.query_one("#runtime_editor", TextArea)
+        strategy_editor = self.query_one("#strategy_editor", TextArea)
+
+        runtime_payload = self._parse_editor_object(runtime_editor.text, label="Pulse runtime config")
+        runtime_payload = self._sanitize_runtime_payload(runtime_payload)
+        strategy_payload = self._parse_editor_object(strategy_editor.text, label="Strategy params")
+        runtime_payload["strategy"] = strategy_payload
+        return runtime_payload
 
     def _load_base_from_selected(self) -> None:
         manifest = self._selected_manifest()
@@ -427,17 +758,29 @@ class PulseLauncherApp(App[None]):
         preview = self.query_one("#command_preview", Static)
         try:
             config = self._read_editor_config()
+            resolved_config, credentials_note = self._resolve_credentials_for_runtime(
+                config,
+                persist=False,
+            )
+            config_errors = validate_effective_config(resolved_config)
+            if config_errors:
+                raise LauncherStorageError("; ".join(config_errors))
             command, cwd = self._build_command()
             shell_line = " ".join(shlex.quote(arg) for arg in command)
-            strategy_name = str(config.get("strategy_name") or "")
-            strategy_paths = config.get("strategy_paths") or []
+            strategy_name = str(resolved_config.get("strategy_name") or "")
+            strategy_paths = resolved_config.get("strategy_paths") or []
             paths_summary = ", ".join(str(item) for item in strategy_paths) or "(none)"
+            broker_adapter = str((resolved_config.get("broker") or {}).get("adapter") or "(none)")
+            chronos_enabled = bool((resolved_config.get("chronos") or {}).get("enabled", False))
             preview.update(
                 f"$ {shell_line}\n"
                 f"cwd: {cwd}\n"
                 f"config: {self._effective_config_path()}\n"
                 f"strategy_name: {strategy_name}\n"
-                f"strategy_paths: {paths_summary}"
+                f"strategy_paths: {paths_summary}\n"
+                f"broker: {broker_adapter}\n"
+                f"chronos: {'enabled' if chronos_enabled else 'disabled'}\n"
+                f"credentials: {credentials_note}"
             )
             self._set_status("Config valid")
         except LauncherStorageError as exc:
@@ -451,6 +794,13 @@ class PulseLauncherApp(App[None]):
 
         try:
             config = self._read_editor_config()
+            resolved_config, _ = self._resolve_credentials_for_runtime(
+                config,
+                persist=True,
+            )
+            config_errors = validate_effective_config(resolved_config)
+            if config_errors:
+                raise LauncherStorageError("; ".join(config_errors))
             command, cwd = self._build_command()
         except LauncherStorageError as exc:
             self._set_status(str(exc), error=True)
@@ -459,12 +809,12 @@ class PulseLauncherApp(App[None]):
         effective_path = self._effective_config_path()
         effective_path.parent.mkdir(parents=True, exist_ok=True)
         effective_path.write_text(
-            json.dumps(config, indent=2, ensure_ascii=True),
+            json.dumps(resolved_config, indent=2, ensure_ascii=True),
             encoding="utf-8",
         )
 
         env = dict(os.environ)
-        strategy_paths = [str(item).strip() for item in (config.get("strategy_paths") or []) if str(item).strip()]
+        strategy_paths = [str(item).strip() for item in (resolved_config.get("strategy_paths") or []) if str(item).strip()]
         if strategy_paths:
             previous = env.get("PYTHONPATH", "")
             merged = strategy_paths + ([previous] if previous else [])
@@ -565,6 +915,16 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         help="Default Pulse working directory shown in UI (override env/config).",
     )
     parser.add_argument(
+        "--keyring-path",
+        default=None,
+        help="Encrypted keyring file path (override env/config).",
+    )
+    parser.add_argument(
+        "--keyring-passphrase-env",
+        default=None,
+        help="Environment variable name that stores keyring passphrase.",
+    )
+    parser.add_argument(
         "--config",
         default=None,
         help=(
@@ -588,6 +948,8 @@ def main() -> int:
         catalog_dirs=settings.catalog_dirs,
         default_pulse_cmd=settings.pulse_cmd,
         default_pulse_cwd=settings.pulse_cwd,
+        keyring_path=settings.keyring_path,
+        keyring_passphrase_env=settings.keyring_passphrase_env,
         config_path=settings.config_path,
     )
     app.run()

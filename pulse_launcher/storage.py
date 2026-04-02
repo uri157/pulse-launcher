@@ -9,28 +9,33 @@ from typing import Any
 DEFAULT_RUN: dict[str, Any] = {
     "base_url": "http://localhost:3001",
     "ws_url": "ws://localhost:3001",
-    "session_id": "replace-session-uuid",
     "symbol": "BTCUSDT",
     "stream_mode": "kline",
     "interval": "1m",
     "api_key": "replace-api-key",
     "api_secret": "replace-api-secret",
-    "bot_id_hint": "pulse-bot",
-    "auto_start_session": True,
-    "stop_on_session_end": True,
+    "recv_window_ms": 5000,
+    "ws_timeout_seconds": 35.0,
+    "ws_reconnect_max_seconds": 30.0,
     "health_host": "127.0.0.1",
     "health_port": 9109,
     "queue_maxsize": 4096,
+    "queue_offer_timeout_seconds": 0.25,
     "pending_poll_seconds": 1.0,
-    "session_poll_seconds": 4.0,
 }
 
-DEFAULT_PLATFORM: dict[str, Any] = {
+DEFAULT_BROKER: dict[str, Any] = {
+    "adapter": "chronos_simulator",
+}
+
+DEFAULT_CHRONOS: dict[str, Any] = {
     "enabled": False,
     "ingest_path": "/api/v1/live/telemetry",
     "publish_interval_seconds": 2.0,
     "timeout_seconds": 8.0,
 }
+
+DEFAULT_CREDENTIALS: dict[str, Any] = {}
 
 
 @dataclass(frozen=True)
@@ -43,7 +48,9 @@ class StrategyManifest:
     manifest_path: Path
     default_strategy: dict[str, Any]
     default_run: dict[str, Any]
-    default_platform: dict[str, Any]
+    default_broker: dict[str, Any]
+    default_chronos: dict[str, Any]
+    default_credentials: dict[str, Any]
     strategy_paths: list[str]
 
 
@@ -54,8 +61,28 @@ class StrategyPreset:
     strategy_name: str | None
     strategy: dict[str, Any]
     run: dict[str, Any]
-    platform: dict[str, Any]
+    broker: dict[str, Any]
+    chronos: dict[str, Any]
+    credentials: dict[str, Any]
     strategy_paths: list[str]
+
+
+@dataclass(frozen=True)
+class BrokerDescriptor:
+    adapter_id: str
+    display_name: str
+    supported_stream_modes: tuple[str, ...]
+    supports_chronos_sink: bool
+
+
+BROKER_DESCRIPTORS: dict[str, BrokerDescriptor] = {
+    "chronos_simulator": BrokerDescriptor(
+        adapter_id="chronos_simulator",
+        display_name="Chronos Simulator",
+        supported_stream_modes=("kline", "aggTrade"),
+        supports_chronos_sink=True,
+    ),
+}
 
 
 class LauncherStorageError(RuntimeError):
@@ -144,7 +171,9 @@ def _parse_manifest(manifest_path: Path) -> StrategyManifest:
 
     default_strategy = dict(payload.get("default_strategy") or {})
     default_run = dict(payload.get("default_run") or {})
-    default_platform = dict(payload.get("default_platform") or {})
+    default_broker = dict(payload.get("default_broker") or {})
+    default_chronos = dict(payload.get("default_chronos") or payload.get("default_platform") or {})
+    default_credentials = dict(payload.get("default_credentials") or {})
 
     include_source_dir = bool(payload.get("include_source_dir", True))
     raw_strategy_paths = payload.get("strategy_paths", [])
@@ -171,7 +200,9 @@ def _parse_manifest(manifest_path: Path) -> StrategyManifest:
         manifest_path=manifest_path.resolve(),
         default_strategy=default_strategy,
         default_run=default_run,
-        default_platform=default_platform,
+        default_broker=default_broker,
+        default_chronos=default_chronos,
+        default_credentials=default_credentials,
         strategy_paths=strategy_paths,
     )
 
@@ -232,7 +263,9 @@ def load_presets_for_manifest(manifest: StrategyManifest) -> list[StrategyPreset
                 ),
                 strategy=dict(payload.get("strategy") or {}),
                 run=dict(payload.get("run") or {}),
-                platform=dict(payload.get("platform") or {}),
+                broker=dict(payload.get("broker") or {}),
+                chronos=dict(payload.get("chronos") or payload.get("platform") or {}),
+                credentials=dict(payload.get("credentials") or {}),
                 strategy_paths=strategy_paths,
             )
         )
@@ -249,12 +282,29 @@ def deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]
     return merged
 
 
+def _sanitize_run_payload(run_payload: dict[str, Any]) -> dict[str, Any]:
+    sanitized = dict(run_payload)
+    for deprecated_key in (
+        "session_id",
+        "bot_id_hint",
+        "auto_start_session",
+        "stop_on_session_end",
+        "session_poll_seconds",
+    ):
+        sanitized.pop(deprecated_key, None)
+    return sanitized
+
+
 def build_base_config(manifest: StrategyManifest) -> dict[str, Any]:
+    run_payload = deep_merge(DEFAULT_RUN, manifest.default_run)
+    run_payload = _sanitize_run_payload(run_payload)
     return {
         "strategy_name": manifest.entrypoint,
         "strategy_paths": list(manifest.strategy_paths),
-        "run": deep_merge(DEFAULT_RUN, manifest.default_run),
-        "platform": deep_merge(DEFAULT_PLATFORM, manifest.default_platform),
+        "run": run_payload,
+        "broker": deep_merge(DEFAULT_BROKER, manifest.default_broker),
+        "chronos": deep_merge(DEFAULT_CHRONOS, manifest.default_chronos),
+        "credentials": deep_merge(DEFAULT_CREDENTIALS, manifest.default_credentials),
         "strategy": dict(manifest.default_strategy),
     }
 
@@ -264,8 +314,15 @@ def apply_preset(config: dict[str, Any], preset: StrategyPreset) -> dict[str, An
     if preset.strategy_name:
         updated["strategy_name"] = preset.strategy_name
 
-    updated["run"] = deep_merge(dict(updated.get("run") or {}), preset.run)
-    updated["platform"] = deep_merge(dict(updated.get("platform") or {}), preset.platform)
+    updated["run"] = _sanitize_run_payload(
+        deep_merge(dict(updated.get("run") or {}), preset.run)
+    )
+    updated["broker"] = deep_merge(dict(updated.get("broker") or {}), preset.broker)
+    updated["chronos"] = deep_merge(dict(updated.get("chronos") or {}), preset.chronos)
+    updated["credentials"] = deep_merge(
+        dict(updated.get("credentials") or {}),
+        preset.credentials,
+    )
     updated["strategy"] = deep_merge(dict(updated.get("strategy") or {}), preset.strategy)
 
     merged_paths = list(updated.get("strategy_paths") or [])
@@ -274,3 +331,62 @@ def apply_preset(config: dict[str, Any], preset: StrategyPreset) -> dict[str, An
         [str(item) for item in merged_paths if str(item).strip()]
     )
     return updated
+
+
+def list_broker_descriptors() -> list[BrokerDescriptor]:
+    return sorted(BROKER_DESCRIPTORS.values(), key=lambda item: item.display_name.lower())
+
+
+def validate_effective_config(payload: dict[str, Any]) -> list[str]:
+    errors: list[str] = []
+    run_payload = payload.get("run")
+    if not isinstance(run_payload, dict):
+        return ["runtime config requires a 'run' object"]
+    broker_payload = payload.get("broker")
+    if not isinstance(broker_payload, dict):
+        errors.append("runtime config requires a 'broker' object")
+        return errors
+
+    adapter = str(broker_payload.get("adapter") or "").strip().lower()
+    if not adapter:
+        errors.append("broker.adapter is required")
+        return errors
+
+    descriptor = BROKER_DESCRIPTORS.get(adapter)
+    if descriptor is None:
+        available = ", ".join(sorted(BROKER_DESCRIPTORS.keys()))
+        errors.append(
+            f"unsupported broker.adapter '{adapter}' (available: {available})"
+        )
+        return errors
+
+    raw_stream_mode = str(run_payload.get("stream_mode") or "kline").strip().lower()
+    if raw_stream_mode == "kline":
+        stream_mode = "kline"
+    elif raw_stream_mode in {"aggtrade", "agg_trade"}:
+        stream_mode = "aggTrade"
+    else:
+        errors.append(f"unsupported run.stream_mode '{raw_stream_mode}'")
+        return errors
+
+    if stream_mode not in descriptor.supported_stream_modes:
+        supported = ", ".join(descriptor.supported_stream_modes)
+        errors.append(
+            f"broker '{adapter}' does not support stream_mode '{stream_mode}' "
+            f"(supported: {supported})"
+        )
+
+    chronos_payload = payload.get("chronos")
+    if chronos_payload is None:
+        chronos_payload = payload.get("platform")
+    if chronos_payload is not None and not isinstance(chronos_payload, dict):
+        errors.append("chronos/platform config must be an object when provided")
+        return errors
+
+    chronos_enabled = bool((chronos_payload or {}).get("enabled", False))
+    if chronos_enabled and not descriptor.supports_chronos_sink:
+        errors.append(
+            f"broker '{adapter}' cannot publish Chronos telemetry sink"
+        )
+
+    return errors

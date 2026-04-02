@@ -4,5 +4,7 @@
     "/home/dev/Developments/strategies-catalog"
   ],
   "pulse_cmd": "python -m pulse",
-  "pulse_cwd": "/home/dev/Developments/pulse-project/pulse"
+  "pulse_cwd": "/home/dev/Developments/pulse-project/pulse",
+  "keyring_path": "~/.config/pulse-launcher/keyring.enc.json",
+  "keyring_passphrase_env": "PULSE_LAUNCHER_KEYRING_PASSPHRASE"
 }
