@@ -19,6 +19,7 @@
   },
   "default_credentials": {
     "provider": "local_encrypted_file",
-    "venue": "chronos_simulator"
+    "venue": "chronos_simulator",
+    "save_to_keyring": true
   }
 }

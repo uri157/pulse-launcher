@@ -75,7 +75,8 @@ Manifests stay with strategy code (outside launcher), and define `entrypoint` pl
   "default_chronos": { "enabled": true },
   "default_credentials": {
     "provider": "local_encrypted_file",
-    "venue": "chronos_simulator"
+    "venue": "chronos_simulator",
+    "save_to_keyring": true
   },
   "strategy_paths": ["./src"],
   "include_source_dir": true
@@ -89,6 +90,7 @@ Manifests stay with strategy code (outside launcher), and define `entrypoint` pl
 - Lets you choose broker adapter and Chronos telemetry mode from dedicated controls.
 - Lets you edit the effective JSON config directly.
 - Resolves credentials from encrypted local keyring using `venue` + auto-derived strategy fingerprint.
+- Lets you enable/disable key persistence with `credentials.save_to_keyring` (and a UI control).
 - Shows the final command used to run Pulse.
 - Validates adapter capabilities before Preview/Run.
 - Executes Pulse as subprocess and tails logs in UI.

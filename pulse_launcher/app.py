@@ -60,12 +60,15 @@ class PulseLauncherApp(App[None]):
     #left {
       width: 40;
       min-width: 36;
+      height: 1fr;
       padding: 1;
       border: round $surface;
+      overflow-y: auto;
     }
 
     #editor-pane {
       width: 1fr;
+      height: 1fr;
       padding: 1;
       border: round $surface;
     }
@@ -73,6 +76,7 @@ class PulseLauncherApp(App[None]):
     #right {
       width: 48;
       min-width: 44;
+      height: 1fr;
       padding: 1;
       border: round $surface;
     }
@@ -162,6 +166,7 @@ class PulseLauncherApp(App[None]):
         self.manifests: dict[str, StrategyManifest] = {}
         self.presets_by_strategy: dict[str, list[StrategyPreset]] = {}
         self.broker_descriptors: list[BrokerDescriptor] = list_broker_descriptors()
+        self._keyring_sync_enabled: bool = True
         self._process: asyncio.subprocess.Process | None = None
         self._stream_tasks: list[asyncio.Task[None]] = []
         self._watcher_task: asyncio.Task[None] | None = None
@@ -213,6 +218,12 @@ class PulseLauncherApp(App[None]):
                     allow_blank=False,
                     id="chronos_select",
                 )
+                yield Label("Secret Manager Save", classes="section-label")
+                yield Button(
+                    "Save To Keyring: Enabled",
+                    id="keyring_sync_btn",
+                    variant="success",
+                )
 
                 with Horizontal(id="catalog_actions"):
                     yield Button("Load Base", id="load_base_btn")
@@ -261,6 +272,12 @@ class PulseLauncherApp(App[None]):
             self._apply_selected_preset()
             return
         if button_id == "preview_btn":
+            self._update_command_preview()
+            return
+        if button_id == "keyring_sync_btn":
+            self._keyring_sync_enabled = not self._keyring_sync_enabled
+            self._refresh_keyring_sync_button()
+            self._apply_control_overrides()
             self._update_command_preview()
             return
         if button_id == "run_btn":
@@ -434,6 +451,21 @@ class PulseLauncherApp(App[None]):
         chronos_enabled = bool(chronos_payload.get("enabled", False))
         chronos_select.value = "enabled" if chronos_enabled else "disabled"
 
+        credentials_payload = runtime_payload.get("credentials")
+        if not isinstance(credentials_payload, dict):
+            credentials_payload = {}
+        self._keyring_sync_enabled = bool(credentials_payload.get("save_to_keyring", True))
+        self._refresh_keyring_sync_button()
+
+    def _refresh_keyring_sync_button(self) -> None:
+        button = self.query_one("#keyring_sync_btn", Button)
+        if self._keyring_sync_enabled:
+            button.label = "Save To Keyring: Enabled"
+            button.variant = "success"
+        else:
+            button.label = "Save To Keyring: Disabled"
+            button.variant = "warning"
+
     def _apply_control_overrides(self) -> None:
         runtime_editor = self.query_one("#runtime_editor", TextArea)
         try:
@@ -461,6 +493,12 @@ class PulseLauncherApp(App[None]):
         chronos_payload["enabled"] = chronos_select.value == "enabled"
         runtime_payload["chronos"] = chronos_payload
         runtime_payload.pop("platform", None)
+
+        credentials_payload = runtime_payload.get("credentials")
+        if not isinstance(credentials_payload, dict):
+            credentials_payload = {}
+        credentials_payload["save_to_keyring"] = self._keyring_sync_enabled
+        runtime_payload["credentials"] = credentials_payload
 
         runtime_editor.load_text(json.dumps(runtime_payload, indent=2, ensure_ascii=True))
 
@@ -558,6 +596,16 @@ class PulseLauncherApp(App[None]):
             "deployment_id": deployment_id,
         }
 
+    @staticmethod
+    def _save_to_keyring_enabled(credentials_payload: dict[str, Any]) -> bool:
+        value = credentials_payload.get("save_to_keyring", True)
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+            return normalized not in {"0", "false", "no", "off"}
+        return bool(value)
+
     def _resolve_credentials_for_runtime(
         self,
         payload: dict[str, Any],
@@ -576,6 +624,7 @@ class PulseLauncherApp(App[None]):
             raise LauncherStorageError(
                 f"unsupported credentials.provider '{provider}'"
             )
+        save_to_keyring_enabled = self._save_to_keyring_enabled(credentials_payload)
 
         try:
             selector = normalize_selector(
@@ -612,12 +661,15 @@ class PulseLauncherApp(App[None]):
             not self._is_missing_secret(api_key)
             and not self._is_missing_secret(api_secret)
         )
+        persist_effective = persist and save_to_keyring_enabled
 
-        if has_manual_credentials and not persist:
+        if has_manual_credentials and not persist_effective:
             run_payload["api_key"] = api_key
             run_payload["api_secret"] = api_secret
             runtime_payload["run"] = run_payload
-            return runtime_payload, "manual (run.api_key/api_secret)"
+            if save_to_keyring_enabled:
+                return runtime_payload, "manual (run.api_key/api_secret)"
+            return runtime_payload, "manual (keyring save disabled)"
 
         keyring_path_raw = str(credentials_payload.get("keyring_path") or "").strip()
         keyring_path = (
@@ -651,7 +703,7 @@ class PulseLauncherApp(App[None]):
             run_payload["api_key"] = api_key
             run_payload["api_secret"] = api_secret
             runtime_payload["run"] = run_payload
-            if persist:
+            if persist_effective:
                 label = str(credentials_payload.get("label") or "").strip()
                 try:
                     next_records = upsert_record(
@@ -664,7 +716,9 @@ class PulseLauncherApp(App[None]):
                     write_encrypted_keyring(keyring_path, passphrase, next_records)
                 except KeyringError as exc:
                     raise LauncherStorageError(str(exc)) from exc
-            return runtime_payload, f"manual + keyring ({keyring_path})"
+            if persist_effective:
+                return runtime_payload, f"manual + keyring ({keyring_path})"
+            return runtime_payload, "manual (keyring save disabled)"
 
         try:
             resolved = find_by_selector(records, selector)
