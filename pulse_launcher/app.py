@@ -1168,7 +1168,7 @@ class PulseLauncherApp(App[None]):
         raise LauncherStorageError(
             "Pulse python runtime is missing 'websockets'. "
             f"Interpreter: {resolved_runtime_exe}. "
-            "Install deps in that interpreter: pip install -r /home/dev/Developments/pulse-project/pulse/requirements.txt"
+            "Install deps in that interpreter: pip install -r /path/to/pulse/requirements.txt"
         )
 
     def _update_command_preview(self) -> None:

@@ -5,7 +5,7 @@ Terminal UI launcher for Pulse runtime.
 ## Install
 
 ```bash
-cd /home/dev/Developments/pulse-project/pulse-launcher
+cd /path/to/pulse-launcher
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
@@ -15,7 +15,7 @@ pip install -r requirements.txt
 
 ```bash
 python -m pulse_launcher \
-  --workspace /home/dev/Developments/pulse-project/pulse-launcher \
+  --workspace /path/to/pulse-launcher \
   --catalog-dir /abs/path/to/your-strategies-catalog
 ```
 
@@ -25,9 +25,12 @@ Create config file once:
 
 ```bash
 mkdir -p ~/.config/pulse-launcher
-cp /home/dev/Developments/pulse-project/pulse-launcher/launcher.config.example.json \
+cp /path/to/pulse-launcher/launcher.config.example.json \
   ~/.config/pulse-launcher/config.json
 ```
+
+Edit `workspace`, `catalog_dirs`, and `pulse_cwd` in that file for your local
+checkout.
 
 Then launch with no flags:
 
@@ -49,18 +52,21 @@ Priority order:
 - config file
 - internal defaults
 
-## Workspace contract
+## Workspace and catalog contract
 
-Launcher reads only files in `--workspace`:
+Launcher writes local runtime artifacts under `--workspace`:
 
 - `.launcher/effective.json` (generated at runtime)
+- `.launcher/runs/` (subprocess logs and run state)
+- `.launcher/copied_*.json` (fallback files when clipboard integration is unavailable)
 
 Launcher discovers strategies from one or many `--catalog-dir` paths:
 
 - `<catalog-dir>/<strategy-id>/manifest.json` + optional `presets/*.json`
 - or `<catalog-dir>/manifest.json` + optional `presets/*.json` (single-strategy dir)
 
-Manifests stay with strategy code (outside launcher), and define `entrypoint` plus optional `strategy_paths`.
+Manifests stay with strategy code and define `entrypoint` (or legacy
+`strategy_name`) plus optional `strategy_paths`.
 
 ### Manifest minimum schema
 
@@ -68,7 +74,7 @@ Manifests stay with strategy code (outside launcher), and define `entrypoint` pl
 {
   "id": "ema_cross",
   "display_name": "EMA Cross",
-  "entrypoint": "my_strategy_package.builder:build_strategy",
+  "entrypoint": "ema_cross",
   "default_strategy": { "fast_period": 40, "slow_period": 200, "quantity": 0.001 },
   "default_run": { "symbol": "BTCUSDT", "interval": "1m" },
   "default_broker": { "adapter": "chronos_simulator" },
@@ -78,10 +84,15 @@ Manifests stay with strategy code (outside launcher), and define `entrypoint` pl
     "venue": "chronos_simulator",
     "save_to_keyring": true
   },
-  "strategy_paths": ["./src"],
+  "strategy_paths": [],
   "include_source_dir": true
 }
 ```
+
+Use an external entrypoint such as `my_strategy_package.builder:build_strategy`
+with `strategy_paths` when the strategy is not built into Pulse.
+When `include_source_dir` is true, the manifest directory is added to
+`strategy_paths` automatically.
 
 ## What it does
 
@@ -109,14 +120,14 @@ You can change both fields in the launcher before running.
 
 Repository ships a sample catalog only as reference:
 
-- `/home/dev/Developments/pulse-project/pulse-launcher/examples/strategy-catalog`
+- `/path/to/pulse-launcher/examples/strategy-catalog`
 
 You can test it with:
 
 ```bash
 python -m pulse_launcher \
-  --workspace /home/dev/Developments/pulse-project/pulse-launcher \
-  --catalog-dir /home/dev/Developments/pulse-project/pulse-launcher/examples/strategy-catalog
+  --workspace /path/to/pulse-launcher \
+  --catalog-dir /path/to/pulse-launcher/examples/strategy-catalog
 ```
 
 ## Environment variables
@@ -131,3 +142,5 @@ Optional ENV configuration:
 - `PULSE_LAUNCHER_KEYRING_PATH`
 - `PULSE_LAUNCHER_KEYRING_PASSPHRASE_ENV`
 - `PULSE_LAUNCHER_KEYRING_PASSPHRASE`
+- `PULSE_LAUNCHER_CLIPBOARD_CMD`
+- `PULSE_LAUNCHER_ENABLE_OSC52`

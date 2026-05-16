@@ -1,10 +1,10 @@
 {
-  "workspace": "/home/dev/Developments/pulse-project/pulse-launcher",
+  "workspace": "/path/to/pulse-launcher",
   "catalog_dirs": [
-    "/home/dev/Developments/strategies-catalog"
+    "/path/to/strategies-catalog"
   ],
   "pulse_cmd": "python -m pulse",
-  "pulse_cwd": "/home/dev/Developments/pulse-project/pulse",
+  "pulse_cwd": "/path/to/pulse",
   "keyring_path": "~/.config/pulse-launcher/keyring.enc.json",
   "keyring_passphrase_env": "PULSE_LAUNCHER_KEYRING_PASSPHRASE"
 }

@@ -2,7 +2,7 @@
 name = "pulse-launcher"
 version = "0.1.0"
 description = "Terminal launcher UI for Pulse runtime"
-readme = "docs/quickstart.md"
+readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
   "textual>=0.58,<1.0",
