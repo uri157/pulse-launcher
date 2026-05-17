@@ -16,22 +16,6 @@ credentials by hand while keeping execution local.
 - **Subprocess Management:** Previews the execution command and starts/stops Pulse
   as a managed subprocess.
 
-## Install
-
-```bash
-cd /path/to/pulse-launcher
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-```
-
-## Run
-
-```bash
-python -m pulse_launcher \
-  --workspace /path/to/pulse-launcher \
-  --catalog-dir /path/to/pulse-launcher/examples/strategy-catalog
-```
 
 For config-file setup, manifest schema, keyring behavior, and supported
 environment variables, see [docs/quickstart.md](docs/quickstart.md).
